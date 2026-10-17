@@ -57,6 +57,7 @@ from mcp_core.redact import redact_error_text as _redact
 from mcp_core.transport import get_text_budgeted, proxy_from_env
 from pydantic import Field
 
+from wb_connector import internal_api
 from wb_connector.models_output import (
     MetaOut,
     WbCardItem,
@@ -590,6 +591,7 @@ async def wb_card(
     if ctx:
         await ctx.debug(f"wb_card: {len(nm_ids)} nm_ids dest={dest}")
     await _polite_wait()
+    internal_tier = False
 
     try:
         try:
@@ -604,16 +606,32 @@ async def wb_card(
             if text and "<html" in text[:200].lower():
                 log_event("wb_card.blocked", reason="cloudflare_html")
                 raise_tool_error(TransportDownError("Cloudflare HTML page (likely missing dest param)", provider="wb"))
-            if status_code != 200:
+            data = None
+            internal_tier = False
+            if status_code == 403:
+                # Oct 2026: card.wb.ru is wbaas-gated for every non-browser
+                # client (headers/cookies/TLS fingerprint do not matter). The
+                # same-origin __internal tier serves the same v4 product shape.
+                try:
+                    internal_products = await internal_api.card(list(nm_ids))
+                except Exception as exc:
+                    log_event("wb_card.internal_tier_failed", error=_redact(str(exc)))
+                    internal_products = []
+                if internal_products:
+                    data = {"products": internal_products}
+                    internal_tier = True
+                    log_event("wb_card.internal_tier_ok", items=len(internal_products))
+            if data is None and status_code != 200:
                 log_event("wb_card.http_error", status=status_code)
                 raise_tool_error(
                     TransportDownError(f"wb_card HTTP {status_code}", provider="wb", status_code=status_code)
                 )
-            try:
-                data = json.loads(text or "")
-            except json.JSONDecodeError as exc:
-                log_event("wb_card.parse_error", error=_redact(str(exc)))
-                raise_tool_error(ParserDriftError(str(exc), provider="wb"))
+            if data is None:
+                try:
+                    data = json.loads(text or "")
+                except json.JSONDecodeError as exc:
+                    log_event("wb_card.parse_error", error=_redact(str(exc)))
+                    raise_tool_error(ParserDriftError(str(exc), provider="wb"))
         except httpx.HTTPError as exc:
             log_event("wb_card.network_error", error=_redact(str(exc)), exc_type=type(exc).__name__)
             raise_tool_error(TransportDownError(str(exc), provider="wb"))
@@ -634,6 +652,11 @@ async def wb_card(
                 continue  # non-object product entry must not crash (audit wave-2)
             item_dicts.append(_card_item_dict(p))
         warnings = _aggregate_offer_warnings(item_dicts)
+        if internal_tier:
+            warnings.append(
+                "internal tier: card.wb.ru is wbaas-gated, data came from the SPA "
+                "__internal endpoint (wbaas cookie jar)"
+            )
         log_event("wb_card.done", nm_count=len(nm_ids), items=len(item_dicts))
         return WbCardResponse(
             dest=dest,
@@ -1350,11 +1373,22 @@ async def wb_search(
             v9_error = f"{type(exc).__name__}: {exc}"
 
         fallback_used = False
+        internal_used = False
         if not products:
+            log_event("wb_search.v9_unavailable", error=_redact(v9_error or "empty result"))
+            # Oct 2026: search.wb.ru v9 is wbaas-gated for non-browser clients;
+            # the SPA's same-origin endpoint answers with the same product shape.
+            try:
+                products, total_found = await internal_api.search(query, page)
+                internal_used = bool(products)
+                if internal_used:
+                    log_event("wb_search.internal_tier_ok", items=len(products))
+            except Exception as exc:
+                log_event("wb_search.internal_tier_failed", error=_redact(str(exc)))
+        if not products and not internal_used:
             # FALLBACK: the legacy two-step path. Its ids skew stale, but a stale
             # result beats no result when v9 is unavailable, and the response is
             # flagged so the caller knows which path produced it.
-            log_event("wb_search.v9_unavailable", error=_redact(v9_error or "empty result"))
             fallback_used = True
             products, total_found = await _search_via_search_goods(query, dest, page, ctx)
 
@@ -1382,6 +1416,11 @@ async def wb_search(
             item_dicts.append(_card_item_dict(p))
 
         warnings = _aggregate_offer_warnings(item_dicts)
+        if internal_used:
+            warnings.append(
+                "internal tier: v9 search is wbaas-gated, results came from the SPA "
+                "__internal endpoint (wbaas cookie jar)"
+            )
         if fallback_used:
             warnings.append(
                 "fallback: v9 search was unavailable, results came from the legacy id path "

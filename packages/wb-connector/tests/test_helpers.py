@@ -17,6 +17,25 @@ def _tool_error_payload(excinfo) -> dict:
     return json.loads(str(excinfo.value))
 
 
+def _stub_internal_tier(monkeypatch, products=None):
+    """The internal (wbaas) tier is network + cookie-jar bound: stub it.
+
+    Default stub answers nothing, so tests that exercise the legacy path still
+    reach it. Pass a product list to make the internal tier win.
+    """
+    from wb_connector import internal_api
+
+    async def fake_search(query, page=1, dest=None):
+        return (products or []), (len(products) if products else None)
+
+    async def fake_card(nm_ids, dest=None):
+        return products or []
+
+    monkeypatch.setattr(internal_api, "search", fake_search)
+    monkeypatch.setattr(internal_api, "card", fake_card)
+    return internal_api
+
+
 def test_server_version_matches_pyproject():
     pyproject = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())
     assert pyproject["project"]["version"] == server.SERVER_VERSION
@@ -507,6 +526,7 @@ def test_wb_search_reads_products_straight_from_v9(monkeypatch):
 
 def test_wb_search_falls_back_to_legacy_path_when_v9_fails(monkeypatch):
     """A stale result beats no result — but the caller must be told."""
+    _stub_internal_tier(monkeypatch)
     calls = []
 
     async def fake_safe_get_text(client, url):
@@ -598,6 +618,7 @@ def test_wb_search_returns_no_results_when_both_paths_are_empty(monkeypatch):
     v9 answering with an empty product list and the fallback yielding no usable
     ids is a legitimate no-results answer, not a broken parser.
     """
+    _stub_internal_tier(monkeypatch)
 
     async def fake_safe_get_text(client, url):
         if "v9/search" in url:
@@ -618,6 +639,8 @@ def test_wb_search_returns_no_results_when_both_paths_are_empty(monkeypatch):
 
 
 def test_wb_search_empty_ids_returns_no_results_not_error(monkeypatch):
+    _stub_internal_tier(monkeypatch)
+
     async def fake_safe_get_text(client, url):
         return 200, json.dumps([]), None
 
@@ -717,6 +740,7 @@ def test_wb_selfcheck_reviews_uses_feedbacks_fallback_host(monkeypatch):
 
 def test_wb_search_handles_v9_shape_drift_by_falling_back(monkeypatch):
     """If v9's response shape moves, the legacy path still answers."""
+    _stub_internal_tier(monkeypatch)
     calls = []
 
     async def fake_safe_get_text(client, url):
@@ -741,6 +765,54 @@ def test_wb_search_handles_v9_shape_drift_by_falling_back(monkeypatch):
         data = result.model_dump()
         assert data["count"] == 1
         assert any("fallback" in w for w in data["meta"]["warnings"])
+
+    asyncio.run(scenario())
+
+
+def test_wb_search_internal_tier_answers_when_v9_is_gated(monkeypatch):
+    """Oct 2026: v9 is wbaas-gated for non-browser clients; the SPA tier answers."""
+    _stub_internal_tier(
+        monkeypatch,
+        products=[{"id": 123, "name": "x", "brand": "b", "sizes": [], "totalQuantity": 0}],
+    )
+
+    async def fake_safe_get_text(client, url):
+        return 403, "", None
+
+    async def no_wait():
+        return None
+
+    async def scenario():
+        monkeypatch.setattr(server, "_safe_get_text", fake_safe_get_text)
+        monkeypatch.setattr(server, "_polite_wait", no_wait)
+        result = await server.wb_search("x")
+        data = result.model_dump()
+        assert data["count"] == 1
+        assert any("internal tier" in w for w in data["meta"]["warnings"])
+
+    asyncio.run(scenario())
+
+
+def test_wb_card_internal_tier_when_legacy_host_is_gated(monkeypatch):
+    """card.wb.ru 403 must not fail the tool while the SPA tier still answers."""
+    _stub_internal_tier(
+        monkeypatch,
+        products=[{"id": 123, "name": "x", "brand": "b", "sizes": [], "totalQuantity": 0}],
+    )
+
+    async def fake_safe_get_text(client, url):
+        return 403, "", None
+
+    async def no_wait():
+        return None
+
+    async def scenario():
+        monkeypatch.setattr(server, "_safe_get_text", fake_safe_get_text)
+        monkeypatch.setattr(server, "_polite_wait", no_wait)
+        result = await server.wb_card([123])
+        data = result.model_dump()
+        assert data["count"] == 1
+        assert any("internal tier" in w for w in data["meta"]["warnings"])
 
     asyncio.run(scenario())
 
